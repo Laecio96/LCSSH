@@ -1,0 +1,207 @@
+#!/bin/bash
+clear
+#——————————————————
+# CRIADOR POR @LC Dev Team
+# VERSAO 1.3
+# SLOW DNS TUNNEL
+#——————————————————
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+CORTITLE='\033[1;41m'
+DIR='/etc/LCSSH/dns'
+SCOLOR='\033[0m'
+# Deteccao dinamica de arquitetura (x86_64, ARM64, ARM32)
+if ! declare -f lcssh_instalar_slowdns >/dev/null 2>&1; then
+	[[ ! -d /etc/LCSSH ]] && mkdir -p /etc/LCSSH
+	_arch_tmp=$(mktemp 2>/dev/null || { mkdir -p /run/lcssh 2>/dev/null && chmod 700 /run/lcssh 2>/dev/null && echo /run/lcssh/arch.$$; })
+	wget -q -O "$_arch_tmp" "${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}/Install/arch" >/dev/null 2>&1
+	[[ -s "$_arch_tmp" ]] && grep -q 'lcssh_arch_detect' "$_arch_tmp" && cat "$_arch_tmp" >/etc/LCSSH/arch 2>/dev/null
+	rm -f "$_arch_tmp" 2>/dev/null
+	[[ -r /etc/LCSSH/arch ]] && . /etc/LCSSH/arch
+fi
+
+configdns() {
+    interface=$(ip a | awk '/state UP/{print $2}' | cut -d: -f1)
+    # Somente adiciona as regras necessarias: o firewall do servidor NAO e limpo
+    # (iptables -F apagava todas as regras de seguranca ja existentes na maquina)
+    iptables -C INPUT -p udp --dport 5300 -j ACCEPT >/dev/null 2>&1 ||
+        iptables -I INPUT -p udp --dport 5300 -j ACCEPT
+    iptables -t nat -C PREROUTING -i $interface -p udp --dport 53 -j REDIRECT --to-ports 5300 >/dev/null 2>&1 ||
+        iptables -t nat -I PREROUTING -i $interface -p udp --dport 53 -j REDIRECT --to-ports 5300
+    ip6tables -C INPUT -p udp --dport 5300 -j ACCEPT >/dev/null 2>&1 ||
+        ip6tables -I INPUT -p udp --dport 5300 -j ACCEPT
+    ip6tables -t nat -C PREROUTING -i $interface -p udp --dport 53 -j REDIRECT --to-ports 5300 >/dev/null 2>&1 ||
+        ip6tables -t nat -I PREROUTING -i $interface -p udp --dport 53 -j REDIRECT --to-ports 5300
+}
+
+echo -e "${CORTITLE}           LCSSH SLOWDNS (Beta)            ${SCOLOR}"
+installslowdns() {
+    echo -e "\n${YELLOW}ESTEJA CIENTE QUE ESSE METODO AINDA\nESTA NA FASE BETA E QUE ALEM DE SER\nLENTO PODE NAO FUNCIONAR PERFEITAMENTE ! ${SCOLOR}\n"
+    echo -ne "${GREEN}DESEJA CONTINUAR A INSTALACAO ? ${YELLOW}[s/n]:${SCOLOR} "
+    read resp
+    [[ "$resp" != @(s|sim|S|SIM) ]] && {
+        echo -e "\n${RED}Retornando...${SCOLOR}"
+        sleep 2
+        conexao
+    }
+    mkdir /etc/LCSSH/dns >/dev/null 2>&1
+    if declare -f lcssh_instalar_slowdns >/dev/null 2>&1; then
+        # baixa o binario oficial (x86_64) ou compila na propria maquina (ARM)
+        lcssh_instalar_slowdns $DIR/dns-server
+    else
+        wget -P $DIR "${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}/Install/dns-server" >/dev/null 2>&1
+        chmod 755 $DIR/dns-server >/dev/null 2>&1
+    fi
+    if [[ ! -e $DIR/dns-server ]]; then
+        echo -e "\n${RED}[${YELLOW}!${RED}] ${YELLOW}FALHA AO INSTALAR O SLOWDNS NESTA ARQUITETURA (${LCSSH_ARCH:-desconhecida})${SCOLOR}"
+        sleep 3
+        conexao
+        return
+    fi
+    chmod 755 $DIR/dns-server >/dev/null 2>&1
+    $DIR/dns-server -gen-key -privkey-file $DIR/server.key -pubkey-file $DIR/server.pub >/dev/null 2>&1
+    # chave privada do tunel: somente root pode le-la
+    chmod 600 $DIR/server.key >/dev/null 2>&1
+    chmod 644 $DIR/server.pub >/dev/null 2>&1
+    configdns >/dev/null 2>&1
+}
+initslow() {
+    # recompila se o binario instalado nao serve para a arquitetura atual
+    if [[ -e $DIR/dns-server ]] && declare -f lcssh_bin_compativel >/dev/null 2>&1 && ! lcssh_bin_compativel $DIR/dns-server; then
+        echo -e "\n${RED}[${YELLOW}!${RED}] ${YELLOW}BINARIO INCOMPATIVEL COM ${LCSSH_ARCH} - REINSTALANDO${SCOLOR}"
+        declare -f lcssh_instalar_slowdns >/dev/null 2>&1 && lcssh_instalar_slowdns $DIR/dns-server
+        sleep 2
+    fi
+    [[ $(ss -lu | grep -wc '5300') != '0' ]] && {
+        echo -e "\n${RED}[${CYAN}1${RED}] ${YELLOW}PARAR O SLOWDNS${SCOLOR}"
+        echo -e "${RED}[${CYAN}2${RED}] ${YELLOW}REMOVER O SLOWDNS${SCOLOR}"
+        echo -e "${RED}[${CYAN}3${RED}] ${YELLOW}EXIBIR INFORMACOES${SCOLOR}"
+        echo -e "${RED}[${CYAN}0${RED}] ${YELLOW}VOLTAR${SCOLOR}"
+        echo -ne "\n${GREEN}INFORME UMA OPCAO${SCOLOR}: "
+        read op
+        if [[ "$op" == '1' ]]; then
+            screen -r -S "slow_dns" -X quit >/dev/null 2>&1
+            screen -wipe >/dev/null 2>&1
+            sed -i '/5300/d' /etc/autostart >/dev/null 2>&1
+            sed -i '/slow_dns/d' /etc/LCSSH/dns/autodns >/dev/null 2>&1
+            echo -e "\n${RED}SLOWDNS DESATIVADO !${SCOLOR}"
+            sleep 2
+            conexao
+        elif [[ "$op" == '2' ]]; then
+            screen -r -S "slow_dns" -X quit >/dev/null 2>&1
+            screen -wipe >/dev/null 2>&1
+            sed -i '/5300/d' /etc/autostart >/dev/null 2>&1
+            rm -rf /etc/LCSSH/dns >/dev/null 2>&1
+            echo -e "\n${RED}SLOWDNS REMOVIDO !${SCOLOR}"
+            sleep 2
+            conexao
+        elif [[ "$op" == '3' ]]; then
+            [[ -e $DIR/server.pub ]] && keypub=$(cat $DIR/server.pub) || keypub='Null'
+            [[ -e $DIR/autodns ]] && nameserver=$(grep -w 'server.key' /etc/LCSSH/dns/autodns | awk -F' ' '{print $9}') || nameserver='Null'
+            # Comando do cliente no Termux - baixa do proprio repositorio
+            _repo="${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}"
+            ip_vps=$(cat /etc/IP 2>/dev/null)
+            [[ -z "$ip_vps" ]] && ip_vps='<IP_DO_SERVIDOR>'
+            tmx="curl -sO $_repo/Install/slowdns && chmod +x slowdns && ./slowdns"
+            clear
+            echo -e "${CORTITLE}           LCSSH SLOWDNS (Beta)            ${SCOLOR}"
+            echo -e "\n${YELLOW}NAMESERVER(NS)${SCOLOR}: $nameserver"
+            echo -e "${YELLOW}CHAVE PUBLICA${SCOLOR}: $keypub"
+            echo -e "\n${GREEN}COMANDO TERMUX${SCOLOR}: ${tmx} ${nameserver} ${keypub} ${ip_vps}"
+            echo -ne "\n${RED}ENTER${YELLOW} para retornar ao${GREEN} MENU!${SCOLOR}"
+            read
+            conexao
+        elif [[ "$op" == '0' ]]; then
+            sleep 1
+            conexao
+        else
+            echo -e "\n${RED}OPCAO INVALIDA${SCOLOR}"
+            sleep 1.5
+            conexao
+        fi
+    } || {
+        clear
+        echo -e "${CORTITLE}           LCSSH SLOWDNS (Beta)            ${SCOLOR}"
+        echo -ne "\n${GREEN}INFORME O DOMINIO NS${SCOLOR}: "
+        read ns
+        # So aceita dominio NS valido: impede injecao de argumentos no dns-server
+        if [[ -z "$ns" || ! "$ns" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo -e "\n${RED}DOMINIO INVALIDO${SCOLOR}"
+            sleep 1.5
+            initslow
+        fi
+        echo -e "\n${RED}[${CYAN}1${RED}] ${YELLOW}SLOWDNS SSH${SCOLOR}"
+        echo -e "${RED}[${CYAN}2${RED}] ${YELLOW}SLOWDNS SSL${SCOLOR}"
+        echo -e "${RED}[${CYAN}3${RED}] ${YELLOW}SLOWDNS SSLH${SCOLOR}"
+        echo -e "${RED}[${CYAN}4${RED}] ${YELLOW}SLOWDNS OPENVPN${SCOLOR}"
+        echo -e "${RED}[${CYAN}0${RED}] ${YELLOW}VOLTAR${SCOLOR}"
+        echo -ne "\n${GREEN}INFORME UMA OPCAO${SCOLOR}: "
+        read opcc
+        if [[ "$opcc" == '1' ]]; then
+            ptdns='22'
+        elif [[ "$opcc" == '2' ]]; then
+            ptdns=$(netstat -nplt | grep 'stunnel' | awk {'print $4'} | cut -d: -f2)
+            [[ $ptdns == '' ]] && {
+                echo -e "\n${RED}PRIMEIRO INSTALE O SSL TUNNEL !${SCOLOR}"
+                sleep 1.5
+                initslow
+            }
+        elif [[ "$opcc" == '3' ]]; then
+            ptdns=$(netstat -nplt | grep 'sslh' | awk {'print $4'} | cut -d: -f2)
+            [[ $ptdns == '' ]] && {
+                echo -e "\n${RED}PRIMEIRO INSTALE O SSLH !${SCOLOR}"
+                sleep 1.5
+                initslow
+            }
+        elif [[ "$opcc" == '4' ]]; then
+            [[ ! -e /etc/openvpn/server.conf ]] && {
+                echo -e "\n${RED}PRIMEIRO INSTALE O OPENVPN !${SCOLOR}"
+                sleep 1.5
+                initslow
+            } || {
+                ptdns=$(sed -n 1p /etc/openvpn/server.conf| cut -d' ' -f2)
+            }
+        elif [[ "$opcc" == '0' ]]; then
+            sleep 1.5
+            conexao
+        else
+            echo -e "\n${RED}OPCAO INVALIDA${SCOLOR}"
+            sleep 1.5
+            initslow
+        fi
+        screen -dmS slow_dns $DIR/dns-server -udp :5300 -privkey-file $DIR/server.key ${ns} 0.0.0.0:${ptdns} >/dev/null 2>&1
+        keypub=$(cat $DIR/server.pub)
+        cd $HOME
+        echo -e "\n${YELLOW}ATIVADO O SLOWDNS...${SCOLOR}"
+        [[ ! -e /etc/iptables/rules.v4 ]] && {
+            configdns > /dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt install -y iptables-persistent >/dev/null 2>&1
+        } || {
+            sleep 2
+            configdns > /dev/null 2>&1
+            iptables-save > /etc/iptables/rules.v4
+        }
+        echo "screen -dmS slow_dns $DIR/dns-server -udp :5300 -privkey-file $DIR/server.key ${ns} 0.0.0.0:${ptdns}" >/etc/LCSSH/dns/autodns
+        chmod 755 /etc/LCSSH/dns/autodns >/dev/null 2>&1
+        echo "ss -lu|grep -w '5300' || /etc/LCSSH/dns/autodns" >>/etc/autostart
+        # Comando do cliente no Termux - baixa do proprio repositorio
+        _repo="${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}"
+        ip_vps=$(cat /etc/IP 2>/dev/null)
+        [[ -z "$ip_vps" ]] && ip_vps='<IP_DO_SERVIDOR>'
+        tmx="curl -sO $_repo/Install/slowdns && chmod +x slowdns && ./slowdns"
+        echo -e "\n${GREEN}SLOWDNS ATIVADO !${SCOLOR}"
+        echo -e "\n${YELLOW}COMANDO TERMUX${SCOLOR}: ${tmx} ${ns} ${keypub} ${ip_vps}"
+        echo -ne "\n${RED}ENTER${YELLOW} para retornar ao${GREEN} MENU!${SCOLOR}"
+        read
+        conexao
+    }
+}
+[[ -d $DIR ]] && {
+    initslow
+} || {
+    installslowdns
+    sleep 0.5
+    initslow
+}

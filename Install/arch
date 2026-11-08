@@ -1,0 +1,463 @@
+#!/bin/bash
+#====================================================
+#	SCRIPT: LCSSH - DETECCAO DINAMICA DE ARQUITETURA
+#	DATA ATT:   06 de Nov 2026
+#	FUNCAO:    Detecta a arquitetura do sistema em tempo
+#	           de execucao e fornece os binarios corretos
+#	           (x86_64, ARM64/aarch64, ARM32/armhf, i386)
+#	USO:       . /etc/LCSSH/arch   (source)
+#====================================================
+
+# Base do repositorio (pode ser sobrescrita antes do source)
+[[ -z "$LCSSH_REPO" ]] && LCSSH_REPO='https://raw.githubusercontent.com/laecio96/LCSSH/master'
+# Binario oficial do slowdns (usado apenas em x86_64) - hospedado no proprio
+# repositorio oficial do projeto (o codigo antigo baixava de dominio de terceiros, ja removido)
+[[ -z "$LCSSH_SLOWDNS_URL" ]] && LCSSH_SLOWDNS_URL="$LCSSH_REPO/Install/dns-server"
+# Codigo-fonte usado quando nao existe binario pronto para a arquitetura
+[[ -z "$LCSSH_BADVPN_SRC" ]] && LCSSH_BADVPN_SRC='https://github.com/ambrop72/badvpn/archive/refs/heads/master.tar.gz'
+[[ -z "$LCSSH_DNSTT_SRC" ]] && LCSSH_DNSTT_SRC='https://github.com/gh4rib/dnstt/archive/refs/heads/main.tar.gz'
+[[ -z "$LCSSH_GO_URL" ]] && LCSSH_GO_URL='https://dl.google.com/go'
+[[ -z "$LCSSH_GO_VERSION_URL" ]] && LCSSH_GO_VERSION_URL='https://go.dev/VERSION?m=text'
+# Diretorio temporario privado do root: evita symlink/race em /tmp
+# (um usuario local nao pode pre-criar um link simbolico nesse caminho)
+if [[ -z "$LCSSH_TMPDIR" ]]; then
+	if mkdir -p /run/lcssh 2>/dev/null && chmod 700 /run/lcssh 2>/dev/null; then
+		LCSSH_TMPDIR='/run/lcssh'
+	else
+		LCSSH_TMPDIR=$(mktemp -d 2>/dev/null || echo '/var/tmp')
+	fi
+fi
+[[ -z "$LCSSH_GO_DIR" ]] && LCSSH_GO_DIR="$LCSSH_TMPDIR/gotoolchain"
+
+#----------------------------------------------------
+# DETECCAO DA ARQUITETURA DO SISTEMA
+#----------------------------------------------------
+# Preenche: LCSSH_ARCH (normalizada), LCSSH_ARCH_RAW (uname -m),
+#           LCSSH_ARCH_BITS (32/64), LCSSH_ARCH_FAMILY (x86/arm/outro),
+#           LCSSH_ARCH_LABEL (descricao legivel)
+lcssh_arch_detect() {
+	local raw
+	raw=$(uname -m 2>/dev/null)
+	[[ -z "$raw" ]] && raw='desconhecida'
+	LCSSH_ARCH_RAW="$raw"
+	case "$raw" in
+		x86_64 | amd64) LCSSH_ARCH='x86_64' ;;
+		i386 | i486 | i586 | i686 | x86) LCSSH_ARCH='i386' ;;
+		aarch64 | arm64) LCSSH_ARCH='arm64' ;;
+		armv7l | armv7* | armhf) LCSSH_ARCH='armhf' ;;
+		armv6l | armv6*) LCSSH_ARCH='armel' ;;
+		armel | arm) LCSSH_ARCH='armel' ;;
+		ppc64le | powerpc64le) LCSSH_ARCH='ppc64le' ;;
+		riscv64) LCSSH_ARCH='riscv64' ;;
+		s390x) LCSSH_ARCH='s390x' ;;
+		mips64el | mips64) LCSSH_ARCH='mips64' ;;
+		mips* | mipsel) LCSSH_ARCH='mips' ;;
+		*) LCSSH_ARCH="$raw" ;;
+	esac
+	case "$LCSSH_ARCH" in
+		x86_64 | arm64 | ppc64le | riscv64 | s390x | mips64) LCSSH_ARCH_BITS='64' ;;
+		*) LCSSH_ARCH_BITS='32' ;;
+	esac
+	case "$LCSSH_ARCH" in
+		x86_64 | i386) LCSSH_ARCH_FAMILY='x86' ;;
+		arm64 | armhf | armel) LCSSH_ARCH_FAMILY='arm' ;;
+		*) LCSSH_ARCH_FAMILY='outro' ;;
+	esac
+	case "$LCSSH_ARCH" in
+		x86_64) LCSSH_ARCH_LABEL='Intel/AMD 64 bits' ;;
+		i386) LCSSH_ARCH_LABEL='Intel/AMD 32 bits' ;;
+		arm64) LCSSH_ARCH_LABEL='ARM64 / aarch64' ;;
+		armhf) LCSSH_ARCH_LABEL='ARM 32 bits (armhf / armv7)' ;;
+		armel) LCSSH_ARCH_LABEL='ARM 32 bits (armel / armv6)' ;;
+		ppc64le) LCSSH_ARCH_LABEL='PowerPC 64 bits (little endian)' ;;
+		riscv64) LCSSH_ARCH_LABEL='RISC-V 64 bits' ;;
+		s390x) LCSSH_ARCH_LABEL='IBM s390x' ;;
+		*) LCSSH_ARCH_LABEL="$raw" ;;
+	esac
+	return 0
+}
+
+# Linha resumo: "arm64 - ARM64 / aarch64 - 64 bits"
+lcssh_arch_linha() {
+	lcssh_arch_detect
+	echo "${LCSSH_ARCH} - ${LCSSH_ARCH_LABEL} - ${LCSSH_ARCH_BITS} bits"
+}
+
+#----------------------------------------------------
+# ARQUITETURA DE UM BINARIO (ELF) - sem depender de file/readelf
+#----------------------------------------------------
+# Retorna: x86_64, i386, arm64, armhf, armel, ppc64, riscv64, s390x,
+#          "nao-elf" (scripts/shell) ou "desconhecido"
+lcssh_arch_of_bin() {
+	local f="$1" mag class endian flags mach
+	[[ -f "$f" && -r "$f" ]] || {
+		echo "desconhecido"
+		return 1
+	}
+	mag=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')
+	# Arquivo nao e ELF (script bash/python etc): aceito por padrao
+	[[ "$mag" != "7f454c46" ]] && {
+		echo "nao-elf"
+		return 0
+	}
+	class=$(od -An -tu1 -j4 -N1 "$f" 2>/dev/null | tr -d ' ')
+	endian=$(od -An -tu1 -j5 -N1 "$f" 2>/dev/null | tr -d ' ')
+	# bytes 18-19 = e_machine | bytes 20-23 = e_flags
+	set -- $(od -An -tu1 -j18 -N6 "$f" 2>/dev/null)
+	if [[ "$endian" == "2" ]]; then
+		mach=$(( ${2:-0} * 256 + ${1:-0} ))
+	else
+		mach=$(( ${1:-0} + ${2:-0} * 256 ))
+	fi
+	flags=$(( ${3:-0} + ${4:-0} * 256 + ${5:-0} * 65536 + ${6:-0} * 16777216 ))
+	case "$mach" in
+		62) echo "x86_64" ;;
+		3) echo "i386" ;;
+		183) echo "arm64" ;;
+		40)
+			# ARM 32 bits: 0x400 = hard float (armhf), 0x200 = soft float (armel)
+			if ((flags & 1024)); then
+				echo "armhf"
+			else
+				echo "armel"
+			fi
+			;;
+		21)
+			if [[ "$class" == "2" ]]; then echo "ppc64"; else echo "ppc"; fi
+			;;
+		243)
+			if [[ "$class" == "2" ]]; then echo "riscv64"; else echo "riscv32"; fi
+			;;
+		80) echo "s390x" ;;
+		8 | 10) echo "mips" ;;
+		*) echo "desconhecido" ;;
+	esac
+	return 0
+}
+
+# Compara a arquitetura do binario com a do sistema (0 = compativel)
+lcssh_bin_compativel() {
+	local a
+	[[ -e "$1" ]] || return 1
+	lcssh_arch_detect
+	a=$(lcssh_arch_of_bin "$1")
+	case "$a" in
+		nao-elf | desconhecido) return 0 ;;
+		"$LCSSH_ARCH") return 0 ;;
+	esac
+	# Binario ARM 32 bits roda em qualquer sistema ARM (32 ou 64 bits)
+	if [[ "$a" == "armel" || "$a" == "armhf" ]]; then
+		[[ "$LCSSH_ARCH" == "arm64" || "$LCSSH_ARCH" == "armhf" || "$LCSSH_ARCH" == "armel" ]] && return 0
+	fi
+	# Binario x86 32 bits roda em x86_64
+	[[ "$a" == "i386" && "$LCSSH_ARCH" == "x86_64" ]] && return 0
+	return 1
+}
+
+#----------------------------------------------------
+# UTILITARIOS
+#----------------------------------------------------
+lcssh_baixar() {
+	local url="$1" destino="$2"
+	[[ -z "$url" || -z "$destino" ]] && return 1
+	mkdir -p "$(dirname "$destino")" 2>/dev/null
+	if command -v wget >/dev/null 2>&1; then
+		wget -q -O "$destino" "$url" 2>/dev/null && [[ -s "$destino" ]] && return 0
+	elif command -v curl >/dev/null 2>&1; then
+		curl -sL --connect-timeout 20 -o "$destino" "$url" 2>/dev/null && [[ -s "$destino" ]] && return 0
+	fi
+	rm -f "$destino" 2>/dev/null
+	return 1
+}
+
+lcssh_baixar_texto() {
+	if command -v wget >/dev/null 2>&1; then
+		wget -qO- "$1" 2>/dev/null
+	elif command -v curl >/dev/null 2>&1; then
+		curl -sL --connect-timeout 20 "$1" 2>/dev/null
+	fi
+}
+
+lcssh_pacotes_instalar() {
+	[[ $# -eq 0 ]] && return 1
+	if command -v apt-get >/dev/null 2>&1; then
+		DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1
+	elif command -v dnf >/dev/null 2>&1; then
+		dnf install -y "$@" >/dev/null 2>&1
+	elif command -v yum >/dev/null 2>&1; then
+		yum install -y "$@" >/dev/null 2>&1
+	elif command -v pacman >/dev/null 2>&1; then
+		pacman -S --noconfirm --needed "$@" >/dev/null 2>&1
+	elif command -v zypper >/dev/null 2>&1; then
+		zypper -n --non-interactive install "$@" >/dev/null 2>&1
+	else
+		return 1
+	fi
+}
+
+# "little" ou "big" (necessario para compilar o badvpn)
+lcssh_endian() {
+	local b
+	b=$(printf '\001\000\000\000' | od -An -tu1 2>/dev/null | awk '{print $1}')
+	[[ "$b" == "1" ]] && echo "little" || echo "big"
+}
+
+# Mapeia a arquitetura normalizada para GOARCH
+lcssh_go_arch() {
+	lcssh_arch_detect
+	case "$LCSSH_ARCH" in
+		x86_64) echo "amd64" ;;
+		i386) echo "386" ;;
+		arm64) echo "arm64" ;;
+		armhf | armel) echo "arm" ;;
+		riscv64) echo "riscv64" ;;
+		s390x) echo "s390x" ;;
+		ppc64le) echo "ppc64le" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Versao minima do Go exigida pelo dnstt (slowdns)
+lcssh_go_version_minima='1.21'
+
+lcssh_go_usavel() {
+	local go="$1" v
+	v=$("$go" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+	[[ -z "$v" ]] && return 1
+	[[ $(printf '%s\n' "$lcssh_go_version_minima" "$v" | sort -V | head -n1) == "$lcssh_go_version_minima" ]]
+}
+
+# Devolve o caminho de um Go utilizavel (instala toolchain portatil se preciso)
+lcssh_go_binario() {
+	local go tarball_arch ver url
+	if command -v go >/dev/null 2>&1 && lcssh_go_usavel "$(command -v go)"; then
+		command -v go
+		return 0
+	fi
+	tarball_arch=$(lcssh_go_arch) || return 1
+	case "$tarball_arch" in
+		amd64) tarball_arch='amd64' ;;
+		386) tarball_arch='386' ;;
+		arm64) tarball_arch='arm64' ;;
+		arm)
+			# Toolchain oficial de 32 bits ARM (armv6 roda em armv7)
+			tarball_arch='armv6l'
+			;;
+		*) return 1 ;;
+	esac
+	if [[ ! -x "$LCSSH_GO_DIR/go/bin/go" ]]; then
+		ver=$(lcssh_baixar_texto "$LCSSH_GO_VERSION_URL" | head -n1 | tr -d '\r\n')
+		[[ -z "$ver" || "$ver" != go* ]] && ver='go1.22.5'
+		url="${LCSSH_GO_URL}/${ver}.linux-${tarball_arch}.tar.gz"
+		mkdir -p "$LCSSH_GO_DIR" 2>/dev/null
+		echo "BAIXANDO TOOLCHAIN GO (${ver}) PARA ${LCSSH_ARCH}..." >&2
+		lcssh_baixar "$url" "$LCSSH_GO_DIR/go.tar.gz" || return 1
+		tar -xzf "$LCSSH_GO_DIR/go.tar.gz" -C "$LCSSH_GO_DIR" 2>/dev/null || return 1
+		rm -f "$LCSSH_GO_DIR/go.tar.gz" 2>/dev/null
+	fi
+	[[ -x "$LCSSH_GO_DIR/go/bin/go" ]] || return 1
+	"$LCSSH_GO_DIR/go/bin/go" version >/dev/null 2>&1 || return 1
+	echo "$LCSSH_GO_DIR/go/bin/go"
+}
+
+# Valida o binario executando a geracao de chaves do dnstt (slowdns)
+lcssh_slowdns_valido() {
+	local bin="$1" dir
+	dir=$(mktemp -d 2>/dev/null) || return 1
+	"$bin" -gen-key -privkey-file "$dir/k" -pubkey-file "$dir/p" >/dev/null 2>&1
+	local ok=$?
+	[[ -s "$dir/p" ]] || ok=1
+	rm -rf "$dir" 2>/dev/null
+	return $ok
+}
+
+#----------------------------------------------------
+# INSTALADORES POR ARQUITETURA
+#----------------------------------------------------
+# jq: x86_64 usa o binario estatico oficial (comportamento original),
+#     demais arquiteturas usam o pacote jq da distribuicao
+lcssh_instalar_jq() {
+	local destino="$1" tmp
+	lcssh_arch_detect
+	[[ -z "$destino" ]] && destino=$(command -v jq 2>/dev/null || echo '/usr/bin/jq')
+	if [[ "$LCSSH_ARCH" == "x86_64" ]]; then
+		tmp=$(mktemp -d 2>/dev/null) || { tmp="$LCSSH_TMPDIR/jq.$$"; mkdir -p "$tmp" 2>/dev/null; }
+		if lcssh_baixar "$LCSSH_REPO/Install/jq-linux64" "$tmp/jq"; then
+			chmod 755 "$tmp/jq" 2>/dev/null
+			if lcssh_bin_compativel "$tmp/jq" && "$tmp/jq" --version >/dev/null 2>&1; then
+				cp -f "$tmp/jq" "$destino" 2>/dev/null && chmod 755 "$destino" 2>/dev/null
+				rm -rf "$tmp" 2>/dev/null
+				return 0
+			fi
+		fi
+		rm -rf "$tmp" 2>/dev/null
+	fi
+	# ARM64, ARM32 e demais: pacote multi-arquitetura do apt/dnf
+	command -v jq >/dev/null 2>&1 || lcssh_pacotes_instalar jq
+	command -v jq >/dev/null 2>&1
+}
+
+# badvpn-udpgw: x86_64 baixa o binario oficial; ARM (e demais) compila do fonte
+lcssh_instalar_badvpn() {
+	local destino="${1:-/bin/badvpn-udpgw}" tmp
+	lcssh_arch_detect
+	if [[ -e "$destino" ]] && lcssh_bin_compativel "$destino"; then
+		chmod 755 "$destino" 2>/dev/null
+		return 0
+	fi
+	case "$LCSSH_ARCH" in
+		x86_64)
+			tmp=$(mktemp -d 2>/dev/null) || { tmp="$LCSSH_TMPDIR/badvpn.$$"; mkdir -p "$tmp" 2>/dev/null; }
+			if lcssh_baixar "$LCSSH_REPO/Install/badvpn-udpgw" "$tmp/badvpn-udpgw" &&
+				lcssh_bin_compativel "$tmp/badvpn-udpgw"; then
+				chmod 755 "$tmp/badvpn-udpgw" 2>/dev/null
+				cp -f "$tmp/badvpn-udpgw" "$destino" 2>/dev/null && {
+					rm -rf "$tmp" 2>/dev/null
+					return 0
+				}
+			fi
+			rm -rf "$tmp" 2>/dev/null
+			;;
+	esac
+	# ARM64, ARM32 e demais: compila na propria maquina
+	lcssh_compilar_badvpn "$destino"
+}
+
+lcssh_compilar_badvpn() {
+	local destino="$1" tmp bin=''
+	lcssh_arch_detect
+	tmp=$(mktemp -d 2>/dev/null) || return 1
+	echo "COMPILANDO badvpn-udpgw PARA ${LCSSH_ARCH}..."
+	command -v gcc >/dev/null 2>&1 || lcssh_pacotes_instalar gcc make
+	command -v tar >/dev/null 2>&1 || {
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	if ! lcssh_baixar "$LCSSH_BADVPN_SRC" "$tmp/badvpn.tar.gz"; then
+		echo "FALHA AO BAIXAR O CODIGO-FONTE DO BADVPN"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	fi
+	mkdir -p "$tmp/src" && tar -xzf "$tmp/badvpn.tar.gz" -C "$tmp/src" --strip-components=1 >/dev/null 2>&1
+	[[ -e "$tmp/src/CMakeLists.txt" ]] || {
+		echo "FALHA AO EXTRAIR O CODIGO-FONTE DO BADVPN"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	# 1) metodo oficial: apenas gcc (compile-udpgw.sh)
+	if command -v gcc >/dev/null 2>&1; then
+		mkdir -p "$tmp/build"
+		(cd "$tmp/build" && SRCDIR="$tmp/src" CC=gcc KERNEL=2.6 ENDIAN="$(lcssh_endian)" \
+			bash "$tmp/src/compile-udpgw.sh") >"$tmp/build.log" 2>&1
+		[[ -e "$tmp/build/udpgw" ]] && bin="$tmp/build/udpgw"
+	fi
+	# 2) fallback: cmake
+	if [[ -z "$bin" ]] && command -v cmake >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+		mkdir -p "$tmp/cmbuild"
+		(cd "$tmp/cmbuild" &&
+			cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 "$tmp/src" &&
+			make -j"$(nproc 2>/dev/null || echo 1)" badvpn-udpgw) >"$tmp/cmake.log" 2>&1
+		[[ -e "$tmp/cmbuild/badvpn-udpgw" ]] && bin="$tmp/cmbuild/badvpn-udpgw"
+	fi
+	if [[ -n "$bin" && -e "$bin" ]] && lcssh_bin_compativel "$bin"; then
+		chmod 755 "$bin" 2>/dev/null
+		cp -f "$bin" "$destino" 2>/dev/null && chmod 755 "$destino" 2>/dev/null && {
+			rm -rf "$tmp" 2>/dev/null
+			return 0
+		}
+	fi
+	echo "FALHA AO COMPILAR badvpn-udpgw PARA ${LCSSH_ARCH}"
+	if [[ -s "$tmp/build.log" ]]; then
+		cp -f "$tmp/build.log" $LCSSH_TMPDIR/lcssh-badvpn-build.log 2>/dev/null
+		echo "LOG DA COMPILACAO: $LCSSH_TMPDIR/lcssh-badvpn-build.log"
+	elif [[ -s "$tmp/cmake.log" ]]; then
+		cp -f "$tmp/cmake.log" $LCSSH_TMPDIR/lcssh-badvpn-build.log 2>/dev/null
+		echo "LOG DA COMPILACAO: $LCSSH_TMPDIR/lcssh-badvpn-build.log"
+	fi
+	rm -rf "$tmp" 2>/dev/null
+	return 1
+}
+
+# slowdns (dnstt-server): x86_64 baixa o binario oficial; ARM compila com Go
+lcssh_instalar_slowdns() {
+	local destino="${1:-/etc/LCSSH/dns/dns-server}" tmp
+	lcssh_arch_detect
+	[[ -e "$destino" ]] && chmod 755 "$destino" 2>/dev/null
+	if [[ -e "$destino" ]] && lcssh_bin_compativel "$destino" && lcssh_slowdns_valido "$destino"; then
+		return 0
+	fi
+	mkdir -p "$(dirname "$destino")" 2>/dev/null
+	case "$LCSSH_ARCH" in
+		x86_64)
+			tmp=$(mktemp -d 2>/dev/null) || { tmp="$LCSSH_TMPDIR/slowdns.$$"; mkdir -p "$tmp" 2>/dev/null; }
+			if lcssh_baixar "$LCSSH_SLOWDNS_URL" "$tmp/dns-server"; then
+				chmod 755 "$tmp/dns-server" 2>/dev/null
+				if lcssh_bin_compativel "$tmp/dns-server" && lcssh_slowdns_valido "$tmp/dns-server"; then
+					cp -f "$tmp/dns-server" "$destino" 2>/dev/null && chmod 755 "$destino" 2>/dev/null && {
+						rm -rf "$tmp" 2>/dev/null
+						return 0
+					}
+				fi
+			fi
+			rm -rf "$tmp" 2>/dev/null
+			# download indisponivel: compila localmente
+			;;
+	esac
+	lcssh_compilar_slowdns "$destino"
+}
+
+lcssh_compilar_slowdns() {
+	local destino="$1" tmp go goarch
+	lcssh_arch_detect
+	tmp=$(mktemp -d 2>/dev/null) || return 1
+	echo "COMPILANDO slowdns (dnstt-server) PARA ${LCSSH_ARCH}..."
+	go=$(lcssh_go_binario) || {
+		echo "FALHA: GO DISPONIVEL NAO ENCONTRADO PARA ${LCSSH_ARCH}"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	[[ -x "$go" ]] || {
+		echo "FALHA: GO INVALIDO (${go})"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	goarch=$(lcssh_go_arch) || {
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	if ! lcssh_baixar "$LCSSH_DNSTT_SRC" "$tmp/dnstt.tar.gz"; then
+		echo "FALHA AO BAIXAR O CODIGO-FONTE DO SLOWDNS"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	fi
+	mkdir -p "$tmp/src" && tar -xzf "$tmp/dnstt.tar.gz" -C "$tmp/src" --strip-components=1 >/dev/null 2>&1
+	[[ -d "$tmp/src/dnstt-server" ]] || {
+		echo "FALHA AO EXTRAIR O CODIGO-FONTE DO SLOWDNS"
+		rm -rf "$tmp" 2>/dev/null
+		return 1
+	}
+	(cd "$tmp/src" &&
+		GOOS=linux GOARCH="$goarch" CGO_ENABLED=0 \
+		$([ "$LCSSH_ARCH" == "armhf" ] && echo "GOARM=7") \
+		$([ "$LCSSH_ARCH" == "armel" ] && echo "GOARM=6") \
+		"$go" build -o "$tmp/dns-server" ./dnstt-server) >"$tmp/build.log" 2>&1
+	if [[ -e "$tmp/dns-server" ]] && lcssh_bin_compativel "$tmp/dns-server" && lcssh_slowdns_valido "$tmp/dns-server"; then
+		chmod 755 "$tmp/dns-server" 2>/dev/null
+		cp -f "$tmp/dns-server" "$destino" 2>/dev/null && chmod 755 "$destino" 2>/dev/null && {
+			rm -rf "$tmp" 2>/dev/null
+			return 0
+		}
+	fi
+	echo "FALHA AO COMPILAR slowdns PARA ${LCSSH_ARCH}"
+	if [[ -s "$tmp/build.log" ]]; then
+		cp -f "$tmp/build.log" $LCSSH_TMPDIR/lcssh-slowdns-build.log 2>/dev/null
+		echo "LOG DA COMPILACAO: $LCSSH_TMPDIR/lcssh-slowdns-build.log"
+	fi
+	rm -rf "$tmp" 2>/dev/null
+	return 1
+}
+
+#----------------------------------------------------
+# INICIALIZACAO
+#----------------------------------------------------
+lcssh_arch_detect

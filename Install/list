@@ -1,0 +1,115 @@
+#!/bin/bash
+# Temporario exclusivo do root: evita symlink/race em /tmp (privilege escalation local)
+LCSSH_TMP=$(mkdir -p /run/lcssh 2>/dev/null && chmod 700 /run/lcssh 2>/dev/null && echo /run/lcssh) || LCSSH_TMP=$(mktemp -d 2>/dev/null || echo /tmp)
+#====================================================
+#	SCRIPT: CONEXAO LCSSH MANAGER
+#   DATA ATT:   28 de Set 2020
+#	DESENVOLVIDO POR:	LC Dev Team
+#	CANAL TELEGRAM:	http://t.me/lcssh
+#====================================================
+_lvk=$(wget -qO- "${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}/Install/versao")
+# IP publico do VPS via servicos publicos (HTTPS) - sem dependencia de dominios de terceiros
+IP=$(wget -qO- https://api.ipify.org)
+IP2=$(wget -qO- https://whatismyip.akamai.com/)
+[[ -z "$IP" ]] && IP="$IP2"
+[[ -z "$IP2" ]] && IP2="$IP"
+[[ "$IP" != "$IP2" ]] && ipdovps="$IP2" || ipdovps="$IP"
+echo -e "$ipdovps" >/etc/IP
+lst=$1 && lst1=$2 && lst2=$3 && key1=$4 && key2=crz
+# Base do repositorio (pode ser sobrescrita via LCSSH_REPO)
+_repo="${LCSSH_REPO:-https://raw.githubusercontent.com/laecio96/LCSSH/master}"
+echo -e "America/Sao_Paulo" >/etc/timezone
+ln -fs /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime >/dev/null 2>&1
+dpkg-reconfigure --frontend noninteractive tzdata >/dev/null 2>&1
+[[ -z $lst1 ]] && {
+	[[ -n "$lst" ]] && rm -rf "$lst" >/dev/null 2>&1
+	exit 0
+}
+[[ ! -d /etc/LCSSH ]] && mkdir /etc/LCSSH
+# Deteccao dinamica de arquitetura (x86_64, ARM64, ARM32, i386)
+_arch_tmp=$(mktemp 2>/dev/null || { mkdir -p /run/lcssh 2>/dev/null && chmod 700 /run/lcssh 2>/dev/null && echo /run/lcssh/arch.$$; })
+wget -q -O "$_arch_tmp" "$_repo/Install/arch" >/dev/null 2>&1
+[[ -s "$_arch_tmp" ]] && grep -q 'lcssh_arch_detect' "$_arch_tmp" && cat "$_arch_tmp" >/etc/LCSSH/arch 2>/dev/null
+rm -f "$_arch_tmp" 2>/dev/null
+[[ -r /etc/LCSSH/arch ]] && . /etc/LCSSH/arch
+[[ ! -d /etc/LCSSH/senha ]] && mkdir /etc/LCSSH/senha
+[[ ! -e /etc/LCSSH/Exp ]] && touch /etc/LCSSH/Exp
+[[ ! -d /etc/LCSSH/userteste ]] && mkdir /etc/LCSSH/userteste
+[[ ! -d /etc/LCSSH/.tmp ]] && mkdir /etc/LCSSH/.tmp
+[[ ! -d /etc/bot ]] && mkdir /etc/bot
+[[ ! -d /etc/bot/info-users ]] && mkdir /etc/bot/info-users
+[[ ! -d /etc/bot/arquivos ]] && mkdir /etc/bot/arquivos
+[[ ! -d /etc/bot/revenda ]] && mkdir /etc/bot/revenda
+[[ ! -d /etc/bot/suspensos ]] && mkdir /etc/bot/suspensos
+[[ ! -e /etc/bot/lista_ativos ]] && touch /etc/bot/lista_ativos
+[[ ! -e /etc/bot/lista_suspensos ]] && touch /etc/bot/lista_suspensos
+# Dados sensiveis (senhas dos usuarios em texto plano, chave privada do
+# slowdns, dados do bot) ficam legiveis somente pelo root
+chmod -R 700 /etc/LCSSH /etc/bot 2>/dev/null
+echo -e 'by: @laecioc96' >/usr/lib/lcssh && cat /usr/lib/lcssh >$lst2/licence
+netstat -nplt | grep -w 'apache2' | grep -w '80' && sed -i "s/Listen 80/Listen 81/g" /etc/apache2/ports.conf && service apache2 restart
+[[ "$(grep -o '#Port 22' /etc/ssh/sshd_config)" == "#Port 22" ]] && sed -i "s;#Port 22;Port 22;" /etc/ssh/sshd_config && service ssh restart
+grep -v "^PasswordAuthentication" /etc/ssh/sshd_config >$LCSSH_TMP/passlogin && mv $LCSSH_TMP/passlogin /etc/ssh/sshd_config
+echo "PasswordAuthentication yes" >>/etc/ssh/sshd_config
+_dir1='/bin'
+_dir2='/etc/LCSSH'
+rm $_dir2/ShellBot.sh $_dir2/cabecalho $_dir2/open.py $_dir2/proxy.py $_dir2/wsproxy.py >/dev/null 2>&1
+_mdls=("addhost" "delhost" "alterarsenha" "criarusuario" "expcleaner" "mudardata" "remover" "criarteste" "verifbot" "droplimiter" "alterarlimite" "ajuda" "sshmonitor" "badvpn" "userbackup" "instsqd" "blockt" "otimizar" "menu" "speedtest" "banner" "senharoot" "reiniciarservicos" "reiniciarsistema" "attscript" "conexao" "delscript" "detalhes" "botssh" "infousers" "slow_dns" "verifatt" "limiter" "uexpired" "cabecalho" "bot" "open.py" "proxy.py" "wsproxy.py")
+for _arq in ${_mdls[@]}; do
+	[[ -e $_dir1/$_arq ]] && rm $_dir1/$_arq >/dev/null 2>&1
+	wget -c -P $_dir1 "$_repo/Modulos/$_arq"
+	chmod +x $_dir1/$_arq
+done
+mv $_dir1/cabecalho $_dir1/bot $_dir1/open.py $_dir1/proxy.py $_dir1/wsproxy.py $_dir2
+_arq_host="/etc/hosts"
+_host[0]="d1n212ccp6ldpw.cloudfront.net"
+_host[1]="dns.whatsapp.net"
+_host[2]="portalrecarga.vivo.com.br/recarga"
+_host[3]="navegue.vivo.com.br/controle/"
+_host[4]="navegue.vivo.com.br/pre/"
+_host[5]="www.whatsapp.net"
+_host[6]="/LCSSH?"
+for host in ${_host[@]}; do
+	if [[ "$(grep -w "$host" $_arq_host | wc -l)" = "0" ]]; then
+		sed -i "3i\127.0.0.1 $host" $_arq_host
+	fi
+done
+[[ ! -e /etc/autostart ]] && {
+	echo '#!/bin/bash
+clear
+#INICIO AUTOMATICO' >/etc/autostart
+	chmod +x /etc/autostart
+} || {
+	[[ $(ps x | grep "bot_lcssh" | grep -v grep | wc -l) != '0' ]] && wget -qO- "$_repo/Install/ShellBot.sh" >/etc/LCSSH/ShellBot.sh
+	for proc in $(ps x | grep 'dmS' | grep -v 'grep' | awk {'print $1'}); do
+		screen -r -S "$proc" -X quit
+	done
+	screen -wipe >/dev/null
+	echo '#!/bin/bash
+clear
+#INICIO AUTOMATICO' >/etc/autostart
+	chmod +x /etc/autostart
+}
+# Reapenas as entradas do proprio script sao regravadas: os crons do
+# administrador (backups, monitoramento etc) sao preservados
+(
+	crontab -l 2>/dev/null | grep -vE '/bin/verifatt|/etc/autostart|/bin/uexpired'
+	echo "@daily /bin/verifatt"
+	echo "@reboot /etc/autostart"
+	echo "* * * * * /etc/autostart"
+	echo "0 */6 * * * /bin/uexpired"
+) | crontab -
+echo "$_lvk" | sed -n '1 p' | cut -d' ' -f2 >/bin/versao && cat /bin/versao >/home/lcssh
+# jq: binario estatico em x86_64 / pacote da distribuicao nas demais arquiteturas
+if declare -f lcssh_instalar_jq >/dev/null 2>&1; then
+	lcssh_instalar_jq
+else
+	# jq: binario estatico do proprio repositorio (antes baixava de terceiros)
+	_destino=$(command -v jq 2>/dev/null)
+	wget -q -O jq-linux64 "$_repo/Install/jq-linux64" >/dev/null 2>&1
+	[[ -s jq-linux64 && -n "$_destino" ]] && chmod 755 jq-linux64 && mv -f jq-linux64 "$_destino"
+fi
+service cron restart >/dev/null 2>&1
+service ssh restart >/dev/null 2>&1
+[[ -d /var/www/html/openvpn ]] && service apache2 restart >/dev/null 2>&1
+rm -rf $lst1/list >/dev/null 2>&1

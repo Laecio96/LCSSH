@@ -1,0 +1,43 @@
+#!/bin/bash
+clear
+[[ ! -d /usr/share/.plus ]] && exit 0
+
+# Pacote do squid do proprio repositorio do SO:
+# 'squid' nos sistemas atuais (Ubuntu 18.04+/Debian 9+), 'squid3' nos antigos
+fun_sqd_pkg() {
+	if apt-cache show squid >/dev/null 2>&1; then
+		echo "squid"
+	elif apt-cache show squid3 >/dev/null 2>&1; then
+		echo "squid3"
+	else
+		echo "squid"
+	fi
+}
+
+# Remove os restos do instalador antigo: repo trusty do Ubuntu 14.04,
+# chave do apt-key (deprecado) e as versoes fixas 3.3.8 que nao existem
+# mais nos repositorios atuais
+fun_sqd_limpa() {
+	[[ -e /etc/apt/sources.list.d/trusty_sources.list ]] && {
+		rm -f /etc/apt/sources.list.d/trusty_sources.list >/dev/null 2>&1
+		apt-key del 3B4FE6ACC0B21F32 >/dev/null 2>&1
+		apt-get remove -y squid3=3.3.8-1ubuntu6 squid=3.3.8-1ubuntu6 squid3-common=3.3.8-1ubuntu6 >/dev/null 2>&1
+		apt-get update -y >/dev/null 2>&1
+		apt-get autoremove -y >/dev/null 2>&1
+	}
+}
+
+fun_sqd01() {
+	fun_sqd_limpa
+	apt-get update -y >/dev/null 2>&1
+	local _pkg
+	_pkg=$(fun_sqd_pkg)
+	DEBIAN_FRONTEND=noninteractive apt-get install -y "$_pkg" >/dev/null 2>&1
+	# Init script legado: somente quando existir o binario antigo squid3
+	[[ -x /usr/sbin/squid3 && ! -e /etc/init.d/squid3 ]] && {
+		wget -qO- https://raw.githubusercontent.com/laecio96/LCSSH/master/squid3 >/etc/init.d/squid3
+		chmod +x /etc/init.d/squid3 >/dev/null 2>&1
+		update-rc.d squid3 defaults >/dev/null 2>&1
+	}
+}
+fun_sqd01
